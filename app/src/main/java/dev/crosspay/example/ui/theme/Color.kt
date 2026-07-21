@@ -1,4 +1,4 @@
-package com.maxint.orca.ui.theme
+package dev.crosspay.example.ui.theme
 
 import androidx.compose.ui.graphics.Color
 

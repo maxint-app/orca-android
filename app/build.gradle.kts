@@ -4,17 +4,15 @@ plugins {
 }
 
 android {
-    namespace = "com.maxint.orca"
+    namespace = "dev.crosspay.example"
     compileSdk {
-        version = release(36) {
-            minorApiLevel = 1
-        }
+        version = release(37)
     }
 
     defaultConfig {
-        applicationId = "com.maxint.orca"
+        applicationId = "dev.crosspay.example"
         minSdk = 24
-        targetSdk = 36
+        targetSdk = 37
         versionCode = 1
         versionName = "1.0"
 

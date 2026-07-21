@@ -14,7 +14,7 @@ enum class OrcaEnvironment {
 data class OrcaConfiguration(
     val publicKey: String,
     val environment: OrcaEnvironment,
-    val baseUrl: String = "https://api.orca.maxint.com/tenant",
+    val baseUrl: String = "https://api.orca.maxint.com",
     val customerEmail: String?
 
 )

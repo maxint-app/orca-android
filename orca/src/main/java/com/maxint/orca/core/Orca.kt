@@ -10,11 +10,13 @@ import com.android.billingclient.api.BillingClientStateListener
 import com.android.billingclient.api.BillingFlowParams
 import com.android.billingclient.api.BillingResult
 import com.android.billingclient.api.ConsumeParams
+import com.android.billingclient.api.PendingPurchasesParams
 import com.android.billingclient.api.ProductDetails
 import com.android.billingclient.api.Purchase
 import com.android.billingclient.api.PurchasesUpdatedListener
 import com.android.billingclient.api.QueryProductDetailsParams
 import com.android.billingclient.api.QueryPurchasesParams
+import okhttp3.Interceptor
 import java.lang.ref.WeakReference
 import com.maxint.orca.generated.apis.TenantApi
 import com.maxint.orca.generated.infrastructure.ApiClient
@@ -85,9 +87,23 @@ object Orca {
 
         billingClient = BillingClient.newBuilder(context)
             .setListener(purchasesUpdatedListener)
+            .enablePendingPurchases(
+                PendingPurchasesParams.newBuilder()
+                    .enableOneTimeProducts()
+                    .build()
+            )
             .build()
 
         api = ApiClient(baseUrl = configuration.baseUrl)
+        api.addAuthorization(
+            "api-key",
+            Interceptor { chain ->
+                val request = chain.request().newBuilder()
+                    .addHeader("api-key", configuration.publicKey)
+                    .build()
+                chain.proceed(request)
+            }
+        )
         tenantApi = api.createService(TenantApi::class.java)
         isConfigured = true
     }
@@ -218,7 +234,7 @@ object Orca {
         cachedPlatformProduct?.let { return it }
         ensureBillingConnected()
 
-        val productIds = entitlements.map { it.products.playstore.id }.toSet()
+        val productIds = entitlements.map { it.products.playstore.productId }.toSet()
         val products = productIds.map { productId ->
             QueryProductDetailsParams.Product.newBuilder()
                 .setProductId(productId)

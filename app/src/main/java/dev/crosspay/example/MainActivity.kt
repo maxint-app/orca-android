@@ -1,4 +1,4 @@
-package com.maxint.orca
+package dev.crosspay.example
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -14,8 +14,8 @@ import androidx.compose.ui.Modifier
 import com.maxint.orca.core.Orca
 import com.maxint.orca.core.OrcaConfiguration
 import com.maxint.orca.core.OrcaEnvironment
-import com.maxint.orca.ui.paywall.PaywallScreen
-import com.maxint.orca.ui.theme.OrcaTheme
+import dev.crosspay.example.ui.paywall.PaywallScreen
+import dev.crosspay.example.ui.theme.OrcaTheme
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -25,9 +25,10 @@ class MainActivity : ComponentActivity() {
         Orca.configure(
             context = this,
             config = OrcaConfiguration(
-                publicKey = "YOUR_PUBLIC_KEY",
+                publicKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJjcm9zc3BheSIsInN1YiI6IjU0OTUwNGMwLTZlMjQtNDE2NS1hMjgxLWQyMTE4NGE0ZGNmZSIsImF1ZCI6WyJwdWJsaWMiLCJhMzhlYmMzYy0xZjFjLTRhMTgtOTFiNy1iYzZlMDIyMGZkMWMiXX0.ojYDgb25aRD68c0WgGS08XDXtrfBGM8sPaDacdZF69I",
                 environment = OrcaEnvironment.SANDBOX,
-                customerEmail = null
+                customerEmail = null,
+                baseUrl = "http://localhost:8081"
             )
         )
 
@@ -38,7 +39,7 @@ class MainActivity : ComponentActivity() {
 
                     if (showPaywall) {
                         PaywallScreen(
-                            customerEmail = "test@example.com",
+                            customerEmail = "krtirtho@maxint.com",
                             onDismiss = { showPaywall = false }
                         )
                     }
