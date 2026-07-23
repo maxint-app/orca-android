@@ -202,7 +202,7 @@ object Orca {
         ensureConfigured()
         ensureBillingConnected()
 
-        val playProductId = resolvePlayStoreProductId(entitlement)
+        val playProductId = entitlement.products.playstore.productId
         val baseProductId = playProductId.substringBefore(":")
         val basePlanId = playProductId.substringAfter(":", "")
 
@@ -211,15 +211,14 @@ object Orca {
         val platformProduct = platformProducts.firstOrNull { it.productId == baseProductId }
             ?: throw IllegalStateException("Product not found: $baseProductId")
 
-        val currentPurchases = queryCurrentPurchases()
-        val alreadyOwned = currentPurchases.any { purchase ->
-            purchase.products.any { it == baseProductId }
-                    && purchase.purchaseState == Purchase.PurchaseState.PURCHASED
-        }
-        if (alreadyOwned) {
-            throw IllegalStateException(
-                "User already purchased entitlement '${entitlement.name}'"
-            )
+        if (entitlement.entitlementType == TenantEntitlement.EntitlementType.non_consumable) {
+            val active = activeEntitlements()
+            val alreadyOwned = active.any { it.entitlementId == entitlement.id }
+            if (alreadyOwned) {
+                throw IllegalStateException(
+                    "User already purchased non-consumable entitlement '${entitlement.name}'"
+                )
+            }
         }
 
         val productDetailsParams = BillingFlowParams.ProductDetailsParams.newBuilder()
@@ -227,9 +226,18 @@ object Orca {
 
         if (platformProduct.productType == BillingClient.ProductType.SUBS) {
             val offerDetails = if (basePlanId.isNotEmpty()) {
-                platformProduct.subscriptionOfferDetails?.firstOrNull { it.basePlanId == basePlanId }
+                val offersForBasePlan = platformProduct.subscriptionOfferDetails
+                    ?.filter { it.basePlanId == basePlanId }
+                    .orEmpty()
+                offersForBasePlan.firstOrNull { it.offerId == null } ?: offersForBasePlan.firstOrNull()
             } else {
-                platformProduct.subscriptionOfferDetails?.firstOrNull()
+                val allOffers = platformProduct.subscriptionOfferDetails.orEmpty()
+                allOffers.firstOrNull { it.offerId == null } ?: allOffers.firstOrNull()
+            }
+            if (basePlanId.isNotEmpty() && offerDetails == null) {
+                throw IllegalStateException(
+                    "Subscription base plan '$basePlanId' not found for product '$baseProductId'."
+                )
             }
             val offerToken = offerDetails?.offerToken
             if (offerToken != null) {
@@ -253,7 +261,7 @@ object Orca {
 
         val subscriptionProducts = entitlements
             .filter { it.entitlementType == TenantEntitlement.EntitlementType.subscription }
-            .map { it to resolvePlayStoreProductId(it).substringBefore(":") }
+            .map { it to it.products.playstore.productId.substringBefore(":") }
             .distinctBy { it.second }
             .map { (_, productId) ->
                 QueryProductDetailsParams.Product.newBuilder()
@@ -264,7 +272,7 @@ object Orca {
 
         val inAppProducts = entitlements
             .filter { it.entitlementType != TenantEntitlement.EntitlementType.subscription }
-            .map { it to resolvePlayStoreProductId(it) }
+            .map { it to it.products.playstore.productId }
             .distinctBy { it.second }
             .map { (_, productId) ->
                 QueryProductDetailsParams.Product.newBuilder()
@@ -441,56 +449,78 @@ object Orca {
         platformProducts: List<ProductDetails>,
         entitlements: List<TenantEntitlement>,
     ): List<StoreProduct> {
-        return platformProducts.mapNotNull { platformProduct ->
-            val entitlement = entitlements.firstOrNull {
-                resolvePlayStoreProductId(it).substringBefore(":") == platformProduct.productId
-            } ?: return@mapNotNull null
+        val productById = platformProducts.associateBy { it.productId }
+
+        return entitlements.flatMap { entitlement ->
+            val resolvedId = entitlement.products.playstore.productId
+            val baseProductId = resolvedId.substringBefore(":")
+            val requestedBasePlanId = resolvedId.substringAfter(":", "")
+            val platformProduct = productById[baseProductId] ?: return@flatMap emptyList()
 
             when (entitlement.entitlementType) {
                 TenantEntitlement.EntitlementType.subscription -> {
-                    val basePlanId =
-                        resolvePlayStoreProductId(entitlement).substringAfter(":", "")
-                    val offerDetails = if (basePlanId.isNotEmpty()) {
-                        platformProduct.subscriptionOfferDetails?.firstOrNull { it.basePlanId == basePlanId }
+                    val offers = platformProduct.subscriptionOfferDetails.orEmpty()
+                    val groupedByBasePlan = offers.groupBy { it.basePlanId }
+                    val basePlans = if (requestedBasePlanId.isNotEmpty()) {
+                        listOf(requestedBasePlanId)
                     } else {
-                        platformProduct.subscriptionOfferDetails?.firstOrNull()
+                        groupedByBasePlan.keys.toList()
                     }
-                    val pricingPhase = offerDetails?.pricingPhases?.pricingPhaseList?.firstOrNull()
-                    StoreProduct.Subscription(
-                        id = resolvePlayStoreProductId(entitlement),
-                        name = platformProduct.title,
-                        currencyCode = pricingPhase?.priceCurrencyCode ?: "",
-                        description = platformProduct.description,
-                        entitlement = entitlement,
-                        price = pricingPhase?.priceAmountMicros?.div(1_000_000f) ?: 0f,
-                        formattedPrice = pricingPhase?.formattedPrice ?: "",
-                        subscriptionPeriodDays = entitlement.periodMs?.let { msToDays(it) },
-                    )
+
+                    basePlans.mapNotNull { basePlanId ->
+                        val offersForBasePlan = groupedByBasePlan[basePlanId].orEmpty()
+                        val defaultOffer = offersForBasePlan.firstOrNull { it.offerId == null }
+                            ?: offersForBasePlan.firstOrNull()
+                            ?: return@mapNotNull null
+
+                        val pricingPhase = defaultOffer.pricingPhases.pricingPhaseList.firstOrNull()
+                        val offerEntitlement = entitlement.copy(
+                            products = entitlement.products.copy(
+                                playstore = entitlement.products.playstore.copy(
+                                    productId = "${platformProduct.productId}:$basePlanId"
+                                )
+                            )
+                        )
+                        StoreProduct.Subscription(
+                            id = "${platformProduct.productId}:$basePlanId",
+                            name = platformProduct.title,
+                            currencyCode = pricingPhase?.priceCurrencyCode ?: "",
+                            description = platformProduct.description,
+                            entitlement = offerEntitlement,
+                            price = pricingPhase?.priceAmountMicros?.div(1_000_000f) ?: 0f,
+                            formattedPrice = pricingPhase?.formattedPrice ?: "",
+                            subscriptionPeriodDays = entitlement.periodMs?.let { msToDays(it) },
+                        )
+                    }
                 }
 
                 TenantEntitlement.EntitlementType.consumable -> {
                     val offer = platformProduct.oneTimePurchaseOfferDetails
-                    StoreProduct.Consumable(
-                        id = platformProduct.productId,
-                        name = platformProduct.title,
-                        currencyCode = offer?.priceCurrencyCode ?: "",
-                        description = platformProduct.description,
-                        entitlement = entitlement,
-                        price = offer?.priceAmountMicros?.div(1_000_000f) ?: 0f,
-                        formattedPrice = offer?.formattedPrice ?: "",
+                    listOf(
+                        StoreProduct.Consumable(
+                            id = baseProductId,
+                            name = platformProduct.title,
+                            currencyCode = offer?.priceCurrencyCode ?: "",
+                            description = platformProduct.description,
+                            entitlement = entitlement,
+                            price = offer?.priceAmountMicros?.div(1_000_000f) ?: 0f,
+                            formattedPrice = offer?.formattedPrice ?: "",
+                        )
                     )
                 }
 
                 TenantEntitlement.EntitlementType.non_consumable -> {
                     val offer = platformProduct.oneTimePurchaseOfferDetails
-                    StoreProduct.NonConsumable(
-                        id = platformProduct.productId,
-                        name = platformProduct.title,
-                        currencyCode = offer?.priceCurrencyCode ?: "",
-                        description = platformProduct.description,
-                        entitlement = entitlement,
-                        price = offer?.priceAmountMicros?.div(1_000_000f) ?: 0f,
-                        formattedPrice = offer?.formattedPrice ?: "",
+                    listOf(
+                        StoreProduct.NonConsumable(
+                            id = baseProductId,
+                            name = platformProduct.title,
+                            currencyCode = offer?.priceCurrencyCode ?: "",
+                            description = platformProduct.description,
+                            entitlement = entitlement,
+                            price = offer?.priceAmountMicros?.div(1_000_000f) ?: 0f,
+                            formattedPrice = offer?.formattedPrice ?: "",
+                        )
                     )
                 }
             }
@@ -498,13 +528,4 @@ object Orca {
     }
 
     private fun msToDays(ms: Long): Int = (ms / (1000L * 60 * 60 * 24)).toInt()
-
-    private fun resolvePlayStoreProductId(entitlement: TenantEntitlement): String {
-        val productId = entitlement.products.playstore.productId.takeIf { it.isNotBlank() }
-            ?: entitlement.products.playstore.id
-        require(productId.isNotBlank()) {
-            "Missing Play productId for entitlement '${entitlement.name}' (${entitlement.id})."
-        }
-        return productId
-    }
 }
