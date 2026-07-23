@@ -15,6 +15,7 @@ import com.android.billingclient.api.ProductDetails
 import com.android.billingclient.api.Purchase
 import com.android.billingclient.api.PurchasesUpdatedListener
 import com.android.billingclient.api.QueryProductDetailsParams
+import com.android.billingclient.api.QueryProductDetailsResult
 import com.android.billingclient.api.QueryPurchasesParams
 import okhttp3.Interceptor
 import java.lang.ref.WeakReference
@@ -89,10 +90,22 @@ object Orca {
             .setListener(purchasesUpdatedListener)
             .enablePendingPurchases(
                 PendingPurchasesParams.newBuilder()
+                    .enablePrepaidPlans()
                     .enableOneTimeProducts()
                     .build()
             )
+            .enableAutoServiceReconnection()
             .build()
+
+        billingClient.startConnection(object : BillingClientStateListener {
+            override fun onBillingSetupFinished(billingResult: BillingResult) {
+                // Connection established or will retry automatically
+            }
+
+            override fun onBillingServiceDisconnected() {
+                // Will reconnect automatically
+            }
+        })
 
         api = ApiClient(baseUrl = configuration.baseUrl)
         api.addAuthorization(
@@ -189,17 +202,18 @@ object Orca {
         ensureConfigured()
         ensureBillingConnected()
 
-        val playProduct = entitlement.products.playstore
-        val productId = playProduct.id
+        val playProductId = resolvePlayStoreProductId(entitlement)
+        val baseProductId = playProductId.substringBefore(":")
+        val basePlanId = playProductId.substringAfter(":", "")
 
         val allEntitlements = listEntitlements()
         val platformProducts = queryPlatformProducts(allEntitlements)
-        val platformProduct = platformProducts.firstOrNull { it.productId == productId }
-            ?: throw IllegalStateException("Product not found: $productId")
+        val platformProduct = platformProducts.firstOrNull { it.productId == baseProductId }
+            ?: throw IllegalStateException("Product not found: $baseProductId")
 
         val currentPurchases = queryCurrentPurchases()
         val alreadyOwned = currentPurchases.any { purchase ->
-            purchase.products.any { it == playProduct.productId }
+            purchase.products.any { it == baseProductId }
                     && purchase.purchaseState == Purchase.PurchaseState.PURCHASED
         }
         if (alreadyOwned) {
@@ -212,9 +226,12 @@ object Orca {
             .setProductDetails(platformProduct)
 
         if (platformProduct.productType == BillingClient.ProductType.SUBS) {
-            val offerToken = platformProduct.subscriptionOfferDetails
-                ?.firstOrNull()
-                ?.offerToken
+            val offerDetails = if (basePlanId.isNotEmpty()) {
+                platformProduct.subscriptionOfferDetails?.firstOrNull { it.basePlanId == basePlanId }
+            } else {
+                platformProduct.subscriptionOfferDetails?.firstOrNull()
+            }
+            val offerToken = offerDetails?.offerToken
             if (offerToken != null) {
                 productDetailsParams.setOfferToken(offerToken)
             }
@@ -234,32 +251,84 @@ object Orca {
         cachedPlatformProduct?.let { return it }
         ensureBillingConnected()
 
-        val productIds = entitlements.map { it.products.playstore.productId }.toSet()
-        val products = productIds.map { productId ->
-            QueryProductDetailsParams.Product.newBuilder()
-                .setProductId(productId)
-                .setProductType(BillingClient.ProductType.SUBS)
+        val subscriptionProducts = entitlements
+            .filter { it.entitlementType == TenantEntitlement.EntitlementType.subscription }
+            .map { it to resolvePlayStoreProductId(it).substringBefore(":") }
+            .distinctBy { it.second }
+            .map { (_, productId) ->
+                QueryProductDetailsParams.Product.newBuilder()
+                    .setProductId(productId)
+                    .setProductType(BillingClient.ProductType.SUBS)
+                    .build()
+            }
+
+        val inAppProducts = entitlements
+            .filter { it.entitlementType != TenantEntitlement.EntitlementType.subscription }
+            .map { it to resolvePlayStoreProductId(it) }
+            .distinctBy { it.second }
+            .map { (_, productId) ->
+                QueryProductDetailsParams.Product.newBuilder()
+                    .setProductId(productId)
+                    .setProductType(BillingClient.ProductType.INAPP)
+                    .build()
+            }
+
+        val products = mutableListOf<ProductDetails>()
+
+        if (subscriptionProducts.isNotEmpty()) {
+            val subsParams = QueryProductDetailsParams.newBuilder()
+                .setProductList(subscriptionProducts)
                 .build()
-        }
 
-        val params = QueryProductDetailsParams.newBuilder()
-            .setProductList(products)
-            .build()
-
-        val result = suspendCancellableCoroutine<Triple<BillingResult, List<ProductDetails>, Boolean>> { cont ->
-            billingClient.queryProductDetailsAsync(params) { billingResult, queryResult ->
-                if (cont.isActive) {
-                    cont.resume(Triple(billingResult, queryResult.productDetailsList, true))
+            val subsResult = suspendCancellableCoroutine { cont ->
+                billingClient.queryProductDetailsAsync(subsParams) { billingResult, queryResult ->
+                    if (cont.isActive) {
+                        cont.resume(Triple(billingResult, queryResult.productDetailsList, true))
+                    }
                 }
             }
+
+            if (subsResult.first.responseCode != BillingClient.BillingResponseCode.OK) {
+                throw IllegalStateException("Failed to query products: ${subsResult.first.debugMessage}")
+            }
+            if (subsResult.second.isEmpty()) {
+                throw IllegalStateException(
+                    "No subscription products returned from Play Billing. " +
+                        "Ensure this build is installed from Play Internal/App Sharing and product IDs are correct."
+                )
+            }
+
+            products.addAll(subsResult.second)
         }
 
-        if (result.first.responseCode != BillingClient.BillingResponseCode.OK) {
-            throw IllegalStateException("Failed to query products: ${result.first.debugMessage}")
+        if (inAppProducts.isNotEmpty()) {
+            val inAppParams = QueryProductDetailsParams.newBuilder()
+                .setProductList(inAppProducts)
+                .build()
+
+            val inAppResult = suspendCancellableCoroutine { cont ->
+                billingClient.queryProductDetailsAsync(inAppParams) { billingResult, queryResult ->
+                    if (cont.isActive) {
+                        cont.resume(Triple(billingResult, queryResult.productDetailsList, true))
+                    }
+                }
+            }
+
+            if (inAppResult.first.responseCode != BillingClient.BillingResponseCode.OK) {
+                throw IllegalStateException("Failed to query products: ${inAppResult.first.debugMessage}")
+            }
+            if (inAppResult.second.isEmpty()) {
+                throw IllegalStateException(
+                    "No one-time products returned from Play Billing. " +
+                        "Ensure this build is installed from Play Internal/App Sharing and product IDs are correct."
+                )
+            }
+
+            products.addAll(inAppResult.second)
         }
 
-        cachedPlatformProduct = result.second
-        return result.second
+        cachedPlatformProduct = products
+        return products
     }
 
     private suspend fun ensureBillingConnected() {
@@ -374,18 +443,21 @@ object Orca {
     ): List<StoreProduct> {
         return platformProducts.mapNotNull { platformProduct ->
             val entitlement = entitlements.firstOrNull {
-                it.products.playstore.id == platformProduct.productId
+                resolvePlayStoreProductId(it).substringBefore(":") == platformProduct.productId
             } ?: return@mapNotNull null
 
             when (entitlement.entitlementType) {
                 TenantEntitlement.EntitlementType.subscription -> {
-                    val pricingPhase = platformProduct.subscriptionOfferDetails
-                        ?.firstOrNull()
-                        ?.pricingPhases
-                        ?.pricingPhaseList
-                        ?.firstOrNull()
+                    val basePlanId =
+                        resolvePlayStoreProductId(entitlement).substringAfter(":", "")
+                    val offerDetails = if (basePlanId.isNotEmpty()) {
+                        platformProduct.subscriptionOfferDetails?.firstOrNull { it.basePlanId == basePlanId }
+                    } else {
+                        platformProduct.subscriptionOfferDetails?.firstOrNull()
+                    }
+                    val pricingPhase = offerDetails?.pricingPhases?.pricingPhaseList?.firstOrNull()
                     StoreProduct.Subscription(
-                        id = platformProduct.productId,
+                        id = resolvePlayStoreProductId(entitlement),
                         name = platformProduct.title,
                         currencyCode = pricingPhase?.priceCurrencyCode ?: "",
                         description = platformProduct.description,
@@ -426,4 +498,13 @@ object Orca {
     }
 
     private fun msToDays(ms: Long): Int = (ms / (1000L * 60 * 60 * 24)).toInt()
+
+    private fun resolvePlayStoreProductId(entitlement: TenantEntitlement): String {
+        val productId = entitlement.products.playstore.productId.takeIf { it.isNotBlank() }
+            ?: entitlement.products.playstore.id
+        require(productId.isNotBlank()) {
+            "Missing Play productId for entitlement '${entitlement.name}' (${entitlement.id})."
+        }
+        return productId
+    }
 }
